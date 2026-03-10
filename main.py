@@ -6,6 +6,8 @@ CLI usage:
     python main.py *.pdf
     python main.py scan.pdf --output /path/to/dir
     python main.py scan.pdf --format jpeg --quality 85
+    python main.py scan.pdf --mode grayscale
+    python main.py scan.pdf --mode color --format jpeg
 
 Web/server usage:
     uvicorn main:app --host 0.0.0.0 --port 8000
@@ -15,6 +17,7 @@ Environment variables (all optional):
     PAGEFORGE_OUTPUT          Output folder for images      (default: /data/output)
     PAGEFORGE_DPI             Render DPI                    (default: 300)
     PAGEFORGE_THRESHOLD       Binarize threshold 0-255      (default: 160)
+    PAGEFORGE_MODE            bw | grayscale | color        (default: bw)
     PAGEFORGE_FORMAT          Output format: png or jpeg    (default: png)
     PAGEFORGE_JPEG_QUALITY    JPEG quality 1-95             (default: 85)
     PAGEFORGE_ENABLE_UPLOAD   Allow web uploads             (default: true)
@@ -50,6 +53,7 @@ DEFAULTS = {
     "threshold": 160,
     "format": "png",
     "jpeg_quality": 85,
+    "mode": "bw",          # bw | grayscale | color
     "enable_upload": True,
     "drive_folder_id": "",
     "sync_interval_minutes": 30,
@@ -62,6 +66,7 @@ ENV_MAP = {
     "PAGEFORGE_THRESHOLD": ("threshold", int),
     "PAGEFORGE_FORMAT": "format",
     "PAGEFORGE_JPEG_QUALITY": ("jpeg_quality", int),
+    "PAGEFORGE_MODE": "mode",
     "PAGEFORGE_ENABLE_UPLOAD": ("enable_upload", lambda v: v.lower() in ("1", "true", "yes")),
     "DRIVE_FOLDER_ID": "drive_folder_id",
     "SYNC_INTERVAL_MINUTES": ("sync_interval_minutes", int),
@@ -127,7 +132,12 @@ def pdf_to_images(
     cfg: dict,
     progress_cb=None,
 ) -> int:
-    """Convert each PDF page to a high-contrast B&W image. Returns page count.
+    """Convert each PDF page to an image. Returns page count.
+
+    Modes (cfg['mode']):
+        bw        — grayscale render → autocontrast → sharpen × 2 → binarize (default)
+        grayscale — grayscale render → autocontrast → sharpen × 2 (no binarize)
+        color     — color render → autocontrast → sharpen × 2 (full color, no binarize)
 
     progress_cb(current, total) is called after each page if provided.
     """
@@ -135,6 +145,7 @@ def pdf_to_images(
     threshold = int(cfg.get("threshold", 160))
     fmt = cfg.get("format", "png").lower()
     jpeg_quality = int(cfg.get("jpeg_quality", 85))
+    mode = cfg.get("mode", "bw").lower()
 
     if fmt not in ("png", "jpeg", "jpg"):
         fmt = "png"
@@ -147,15 +158,27 @@ def pdf_to_images(
     for i, page in enumerate(doc, 1):
         dest = out_dir / f"{stem}_p{i:03d}.{ext}"
         mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csGRAY)
-        img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+
+        if mode == "color":
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        else:
+            pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csGRAY)
+            img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+
         img = ImageOps.autocontrast(img, cutoff=2)
         img = img.filter(ImageFilter.SHARPEN)
         img = img.filter(ImageFilter.SHARPEN)
-        img = img.point(lambda x: 0 if x < threshold else 255)
+
+        if mode == "bw":
+            img = img.point(lambda x: 0 if x < threshold else 255)
+
         buf = io.BytesIO()
         if ext == "jpg":
-            img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+            if img.mode == "L" and mode != "color":
+                img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+            else:
+                img.convert("RGB").save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
         else:
             img.save(buf, format="PNG", optimize=True)
         dest.write_bytes(buf.getvalue())
@@ -357,7 +380,7 @@ async def api_set_config(body: dict):
     cfg = load_config()
     allowed = {
         "inbox_dir", "output_dir", "dpi", "threshold",
-        "format", "jpeg_quality",
+        "format", "jpeg_quality", "mode",
         "enable_upload", "drive_folder_id", "sync_interval_minutes",
     }
     for k, v in body.items():
@@ -418,6 +441,24 @@ async def api_upload(file: UploadFile = File(...)):
     return {"ok": True, "stem": stem, "message": "Processing\u2026"}
 
 
+@app.delete("/api/record/{stem}")
+def api_delete_record(stem: str):
+    stem = _sanitize_stem(stem)
+    cfg = load_config()
+    state = load_state(cfg)
+    if stem not in state.get("processed", {}):
+        raise HTTPException(404, "Record not found")
+    # Remove state entry
+    del state["processed"][stem]
+    save_state(state, cfg)
+    # Delete output directory
+    import shutil
+    pages_dir = Path(cfg["output_dir"]) / f"{stem}_pages"
+    if pages_dir.exists():
+        shutil.rmtree(pages_dir)
+    return {"ok": True}
+
+
 @app.get("/api/download/{stem}")
 def api_download_stem(stem: str):
     stem = _sanitize_stem(stem)
@@ -427,7 +468,7 @@ def api_download_stem(stem: str):
         raise HTTPException(404, "Not found")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
-        for img in sorted(pages_dir.glob("*.png")):
+        for img in sorted([*pages_dir.glob("*.png"), *pages_dir.glob("*.jpg")]):
             zf.write(img, img.name)
     buf.seek(0)
     return StreamingResponse(
@@ -452,7 +493,7 @@ def api_download_date(date: str):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
         for d in dirs:
-            for img in sorted(d.glob("*.png")):
+            for img in sorted([*d.glob("*.png"), *d.glob("*.jpg")]):
                 zf.write(img, img.name)
     buf.seek(0)
     return StreamingResponse(
@@ -478,8 +519,9 @@ def _cli():
     parser.add_argument("--output", "-o", metavar="DIR", help="Output directory (default: <pdf_dir>/<stem>_pages/)")
     parser.add_argument("--format", "-f", choices=["png", "jpeg"], default=None, help="Output image format (default: from config or png)")
     parser.add_argument("--quality", "-q", type=int, metavar="1-95", help="JPEG quality, 1-95 (default: 85, only applies to jpeg)")
+    parser.add_argument("--mode", "-m", choices=["bw", "grayscale", "color"], default=None, help="Image mode: bw (default), grayscale, or color")
     parser.add_argument("--dpi", type=int, help="Render DPI (default: from config or 300)")
-    parser.add_argument("--threshold", type=int, help="Binarize threshold 0-255 (default: from config or 160)")
+    parser.add_argument("--threshold", type=int, help="Binarize threshold 0-255 (default: from config or 160, only applies to bw mode)")
     args = parser.parse_args()
 
     if not args.pdfs:
@@ -492,6 +534,8 @@ def _cli():
         cfg["format"] = args.format
     if args.quality:
         cfg["jpeg_quality"] = args.quality
+    if args.mode:
+        cfg["mode"] = args.mode
     if args.dpi:
         cfg["dpi"] = args.dpi
     if args.threshold:
@@ -521,7 +565,8 @@ def _cli():
         out_dir = Path(args.output) if args.output else pdf_path.parent / f"{stem}_pages"
 
         fmt_label = cfg.get("format", "png").upper()
-        print(f"\n[>] {pdf_path.name}  →  {out_dir}/  [{fmt_label}]")
+        mode_label = cfg.get("mode", "bw").upper()
+        print(f"\n[>] {pdf_path.name}  →  {out_dir}/  [{mode_label} · {fmt_label}]")
 
         def _progress(current, total, _stem=stem):
             bar_len = 30
@@ -669,6 +714,10 @@ HTML = """<!DOCTYPE html>
     .btn-dl { padding: .28rem .8rem; font-size: .73rem; border-radius: 5px; border: 1px solid #1f2d45;
               background: transparent; color: #64748b; cursor: pointer; font-weight: 500; transition: all .15s; white-space: nowrap; }
     .btn-dl:hover { border-color: #4f46e5; color: #a5b4fc; background: #1e1b4b; }
+    .btn-del { padding: .28rem .6rem; font-size: .73rem; border-radius: 5px; border: 1px solid #2a1010;
+               background: transparent; color: #475569; cursor: pointer; font-weight: 500; transition: all .15s; white-space: nowrap; }
+    .btn-del:hover { border-color: #7f1d1d; color: #f87171; background: #1a0a0a; }
+    .row-actions { display: flex; gap: .35rem; align-items: center; justify-content: flex-end; }
     .empty { text-align: center; padding: 2.5rem 1rem; color: #334155; font-size: .86rem; }
 
     /* ── Upload tab ── */
@@ -813,6 +862,14 @@ HTML = """<!DOCTYPE html>
           <div class="range-val"><span id="dpi-val">300</span> DPI</div>
         </div>
         <div class="field">
+          <label>Color mode</label>
+          <select id="cfg-mode" style="width:100%;background:#0a0f1e;border:1px solid #1f2d45;border-radius:6px;padding:.45rem .75rem;color:#e2e8f0;font-size:.83rem;outline:none;">
+            <option value="bw">B&amp;W — binarized, best for OCR</option>
+            <option value="grayscale">Grayscale — no binarize, good for photos</option>
+            <option value="color">Color — full color, largest files</option>
+          </select>
+        </div>
+        <div class="field" id="thresholdField">
           <label>Binarize threshold (0&ndash;255)</label>
           <input type="range" id="cfg-threshold" min="0" max="255" step="1"
                  oninput="document.getElementById('thr-val').textContent=this.value">
@@ -1025,7 +1082,10 @@ HTML = """<!DOCTYPE html>
         + '<span class="date-sub">'+MN[jsD.getMonth()]+' '+jsD.getDate()+', '+yr+'</span></td>'
         + '<td><span class="src-badge '+stemSources[0]+'">'+src+'</span></td>'
         + '<td><span class="pill">'+info.images+' page'+(info.images!==1?'s':'')+'</span></td>'
-        + '<td><button class="btn-dl" data-date="'+date+'" onclick="dlDate(this.dataset.date)">&#8595; ZIP</button></td>'
+        + '<td><div class="row-actions">'
+        + '<button class="btn-dl" data-date="'+date+'" onclick="dlDate(this.dataset.date)">&#8595; ZIP</button>'
+        + info.stems.map(s => '<button class="btn-del" data-stem="'+s+'" onclick="delRecord(this)" title="Delete '+s+'">&#10005;</button>').join('')
+        + '</div></td>'
         + '</tr>';
     }
     if (multiYear && prevYear) rows += '</tbody>';
@@ -1041,7 +1101,8 @@ HTML = """<!DOCTYPE html>
           + '<td><span class="date-str" style="font-size:.8rem">'+stem+'</span></td>'
           + '<td><span class="src-badge '+src+'">'+src+'</span></td>'
           + '<td><span class="pill">'+(info?.page_count||'?')+' page'+((info?.page_count||0)!==1?'s':'')+'</span></td>'
-          + '<td><button class="btn-dl" data-stem="'+stem+'" onclick="dlStem(this.dataset.stem)">&#8595; ZIP</button></td>'
+          + '<td><div class="row-actions"><button class="btn-dl" data-stem="'+stem+'" onclick="dlStem(this.dataset.stem)">&#8595; ZIP</button>'
+          + '<button class="btn-del" data-stem="'+stem+'" onclick="delRecord(this)" title="Delete '+stem+'">&#10005;</button></div></td>'
           + '</tr>';
       }
       rows += '</tbody>';
@@ -1079,6 +1140,22 @@ HTML = """<!DOCTYPE html>
 
   function dlDate(date) { window.location = '/api/download-date/' + date; }
   function dlStem(stem) { window.location = '/api/download/' + encodeURIComponent(stem); }
+
+  async function delRecord(btn) {
+    const stem = btn.dataset.stem;
+    if (!confirm('Delete all images for "' + stem + '"?\nThis cannot be undone.')) return;
+    btn.disabled = true;
+    btn.textContent = '\u2026';
+    try {
+      const res = await fetch('/api/record/' + encodeURIComponent(stem), {method: 'DELETE'});
+      if (!res.ok) throw new Error((await res.json()).detail || 'Delete failed');
+      await loadState();
+    } catch(e) {
+      alert('Error: ' + e.message);
+      btn.disabled = false;
+      btn.textContent = '\u2715';
+    }
+  }
 
   // ── Upload ───────────────────────────────────────────────────────────────
   function handleDrop(e) {
@@ -1136,6 +1213,11 @@ HTML = """<!DOCTYPE html>
   function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
   // ── Settings ─────────────────────────────────────────────────────────────
+  function _updateModeFields() {
+    const mode = document.getElementById('cfg-mode').value;
+    document.getElementById('thresholdField').style.display = mode === 'bw' ? '' : 'none';
+  }
+
   async function loadSettingsForm() {
     const cfg = await (await fetch('/api/config')).json();
     document.getElementById('cfg-inbox_dir').value = cfg.inbox_dir || '';
@@ -1143,6 +1225,10 @@ HTML = """<!DOCTYPE html>
     const dpiEl = document.getElementById('cfg-dpi');
     dpiEl.value = cfg.dpi || 300;
     document.getElementById('dpi-val').textContent = dpiEl.value;
+    const modeEl = document.getElementById('cfg-mode');
+    modeEl.value = cfg.mode || 'bw';
+    modeEl.onchange = _updateModeFields;
+    _updateModeFields();
     const thrEl = document.getElementById('cfg-threshold');
     thrEl.value = cfg.threshold || 160;
     document.getElementById('thr-val').textContent = thrEl.value;
@@ -1165,6 +1251,7 @@ HTML = """<!DOCTYPE html>
       inbox_dir:             document.getElementById('cfg-inbox_dir').value.trim(),
       output_dir:            document.getElementById('cfg-output_dir').value.trim(),
       dpi:                   parseInt(document.getElementById('cfg-dpi').value),
+      mode:                  document.getElementById('cfg-mode').value,
       threshold:             parseInt(document.getElementById('cfg-threshold').value),
       format:                document.getElementById('cfg-format').value,
       jpeg_quality:          parseInt(document.getElementById('cfg-jpeg_quality').value),
