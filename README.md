@@ -25,19 +25,24 @@
 
 ### CLI
 
-Convert a single PDF:
-
 ```bash
+# Single file — output next to the source
 python main.py document.pdf
-```
 
-Convert multiple PDFs using a glob:
-
-```bash
+# Glob — batch convert
 python main.py *.pdf
+
+# Custom output directory
+python main.py scan.pdf --output /path/to/images/
+
+# JPEG output with quality control (much smaller files)
+python main.py scan.pdf --format jpeg --quality 85
+
+# Override DPI and threshold inline
+python main.py scan.pdf --dpi 150 --threshold 180
 ```
 
-Output images are written to a `{stem}_pages/` directory alongside the source file.
+Output images are written to `{stem}_pages/` by default, or the directory specified with `--output`.
 
 ### Docker
 
@@ -82,6 +87,8 @@ All settings are optional. PageForge works with zero configuration.
 | `PAGEFORGE_OUTPUT` | `/data/output` | Root directory where page images are saved |
 | `PAGEFORGE_DPI` | `300` | Render resolution; higher values increase file size and quality |
 | `PAGEFORGE_THRESHOLD` | `160` | Binarize cutoff (0–255); lower values keep more pixels black |
+| `PAGEFORGE_FORMAT` | `png` | Output format: `png` (lossless) or `jpeg` (smaller files) |
+| `PAGEFORGE_JPEG_QUALITY` | `85` | JPEG quality 1–95; only applies when format is `jpeg` |
 | `PAGEFORGE_ENABLE_UPLOAD` | `true` | Set to `false` to disable the web upload endpoint |
 | `SYNC_INTERVAL_MINUTES` | `30` | How often (in minutes) to poll the inbox and Drive folder |
 | `DRIVE_FOLDER_ID` | _(empty)_ | Google Drive folder ID; leave blank to disable Drive sync |

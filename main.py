@@ -2,8 +2,10 @@
 PageForge — Break multi-page PDFs into clean, OCR-ready images.
 
 CLI usage:
-    python main.py input.pdf [output_dir]
+    python main.py input.pdf
     python main.py *.pdf
+    python main.py scan.pdf --output /path/to/dir
+    python main.py scan.pdf --format jpeg --quality 85
 
 Web/server usage:
     uvicorn main:app --host 0.0.0.0 --port 8000
@@ -13,6 +15,8 @@ Environment variables (all optional):
     PAGEFORGE_OUTPUT          Output folder for images      (default: /data/output)
     PAGEFORGE_DPI             Render DPI                    (default: 300)
     PAGEFORGE_THRESHOLD       Binarize threshold 0-255      (default: 160)
+    PAGEFORGE_FORMAT          Output format: png or jpeg    (default: png)
+    PAGEFORGE_JPEG_QUALITY    JPEG quality 1-95             (default: 85)
     PAGEFORGE_ENABLE_UPLOAD   Allow web uploads             (default: true)
     DRIVE_FOLDER_ID           Google Drive folder ID        (enables Drive sync)
     SYNC_INTERVAL_MINUTES     Drive/inbox poll interval     (default: 30)
@@ -44,6 +48,8 @@ DEFAULTS = {
     "output_dir": "/data/output",
     "dpi": 300,
     "threshold": 160,
+    "format": "png",
+    "jpeg_quality": 85,
     "enable_upload": True,
     "drive_folder_id": "",
     "sync_interval_minutes": 30,
@@ -54,6 +60,8 @@ ENV_MAP = {
     "PAGEFORGE_OUTPUT": "output_dir",
     "PAGEFORGE_DPI": ("dpi", int),
     "PAGEFORGE_THRESHOLD": ("threshold", int),
+    "PAGEFORGE_FORMAT": "format",
+    "PAGEFORGE_JPEG_QUALITY": ("jpeg_quality", int),
     "PAGEFORGE_ENABLE_UPLOAD": ("enable_upload", lambda v: v.lower() in ("1", "true", "yes")),
     "DRIVE_FOLDER_ID": "drive_folder_id",
     "SYNC_INTERVAL_MINUTES": ("sync_interval_minutes", int),
@@ -112,17 +120,32 @@ def save_state(state: dict, cfg: dict):
 # PDF → images
 # ---------------------------------------------------------------------------
 
-def pdf_to_images(pdf_bytes: bytes, stem: str, out_dir: Path, cfg: dict) -> int:
-    """Convert each PDF page to a high-contrast B&W PNG. Returns page count."""
+def pdf_to_images(
+    pdf_bytes: bytes,
+    stem: str,
+    out_dir: Path,
+    cfg: dict,
+    progress_cb=None,
+) -> int:
+    """Convert each PDF page to a high-contrast B&W image. Returns page count.
+
+    progress_cb(current, total) is called after each page if provided.
+    """
     dpi = int(cfg.get("dpi", 300))
     threshold = int(cfg.get("threshold", 160))
+    fmt = cfg.get("format", "png").lower()
+    jpeg_quality = int(cfg.get("jpeg_quality", 85))
+
+    if fmt not in ("png", "jpeg", "jpg"):
+        fmt = "png"
+    ext = "jpg" if fmt in ("jpeg", "jpg") else "png"
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = len(doc)
     out_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
 
     for i, page in enumerate(doc, 1):
-        dest = out_dir / f"{stem}_p{i:03d}.png"
+        dest = out_dir / f"{stem}_p{i:03d}.{ext}"
         mat = fitz.Matrix(dpi / 72, dpi / 72)
         pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csGRAY)
         img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
@@ -131,12 +154,16 @@ def pdf_to_images(pdf_bytes: bytes, stem: str, out_dir: Path, cfg: dict) -> int:
         img = img.filter(ImageFilter.SHARPEN)
         img = img.point(lambda x: 0 if x < threshold else 255)
         buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
+        if ext == "jpg":
+            img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+        else:
+            img.save(buf, format="PNG", optimize=True)
         dest.write_bytes(buf.getvalue())
-        count += 1
+        if progress_cb:
+            progress_cb(i, total)
 
     doc.close()
-    return count
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +357,7 @@ async def api_set_config(body: dict):
     cfg = load_config()
     allowed = {
         "inbox_dir", "output_dir", "dpi", "threshold",
+        "format", "jpeg_quality",
         "enable_upload", "drive_folder_id", "sync_interval_minutes",
     }
     for k, v in body.items():
@@ -439,17 +467,44 @@ def api_download_date(date: str):
 # ---------------------------------------------------------------------------
 
 def _cli():
+    import argparse
     import glob as _glob
-    paths = []
-    for arg in sys.argv[1:]:
-        expanded = _glob.glob(arg)
-        if expanded:
-            paths.extend(expanded)
-        else:
-            paths.append(arg)
+
+    parser = argparse.ArgumentParser(
+        prog="pageforge",
+        description="Convert multi-page PDFs into clean, OCR-ready images.",
+    )
+    parser.add_argument("pdfs", nargs="*", metavar="FILE", help="PDF file(s) to process (glob patterns accepted)")
+    parser.add_argument("--output", "-o", metavar="DIR", help="Output directory (default: <pdf_dir>/<stem>_pages/)")
+    parser.add_argument("--format", "-f", choices=["png", "jpeg"], default=None, help="Output image format (default: from config or png)")
+    parser.add_argument("--quality", "-q", type=int, metavar="1-95", help="JPEG quality, 1-95 (default: 85, only applies to jpeg)")
+    parser.add_argument("--dpi", type=int, help="Render DPI (default: from config or 300)")
+    parser.add_argument("--threshold", type=int, help="Binarize threshold 0-255 (default: from config or 160)")
+    args = parser.parse_args()
+
+    if not args.pdfs:
+        parser.print_help()
+        print("\n  Start the web server:  uvicorn main:app --host 0.0.0.0 --port 8000")
+        sys.exit(0)
 
     cfg = load_config()
+    if args.format:
+        cfg["format"] = args.format
+    if args.quality:
+        cfg["jpeg_quality"] = args.quality
+    if args.dpi:
+        cfg["dpi"] = args.dpi
+    if args.threshold:
+        cfg["threshold"] = args.threshold
+
+    # Expand globs
+    paths = []
+    for pat in args.pdfs:
+        expanded = _glob.glob(pat)
+        paths.extend(expanded if expanded else [pat])
+
     ok = err = 0
+    multi = len(paths) > 1
 
     for p in paths:
         pdf_path = Path(p)
@@ -461,23 +516,28 @@ def _cli():
             print(f"[skip] not a PDF: {pdf_path}", file=sys.stderr)
             err += 1
             continue
+
         stem = _sanitize_stem(pdf_path.stem)
-        out_dir = pdf_path.parent / f"{stem}_pages"
-        print(f"[>] {pdf_path.name} \u2192 {out_dir}/", end=" ", flush=True)
+        out_dir = Path(args.output) if args.output else pdf_path.parent / f"{stem}_pages"
+
+        fmt_label = cfg.get("format", "png").upper()
+        print(f"\n[>] {pdf_path.name}  →  {out_dir}/  [{fmt_label}]")
+
+        def _progress(current, total, _stem=stem):
+            bar_len = 30
+            filled = int(bar_len * current / total)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            print(f"\r    [{bar}] {current}/{total}", end="", flush=True)
+
         try:
-            count = pdf_to_images(pdf_path.read_bytes(), stem, out_dir, cfg)
-            print(f"({count} page{'s' if count != 1 else ''})")
+            count = pdf_to_images(pdf_path.read_bytes(), stem, out_dir, cfg, progress_cb=_progress)
+            print(f"\r    {count} page{'s' if count != 1 else ''} saved to {out_dir}/")
             ok += 1
         except Exception as e:
-            print(f"ERROR: {e}", file=sys.stderr)
+            print(f"\n    ERROR: {e}", file=sys.stderr)
             err += 1
 
-    if paths:
-        print(f"\nDone: {ok} succeeded, {err} failed.")
-    else:
-        print("Usage: python main.py input.pdf [more.pdf ...]")
-        print("       uvicorn main:app --host 0.0.0.0 --port 8000   (web server)")
-        sys.exit(1)
+    print(f"\nDone: {ok} succeeded, {err} failed." if multi else "")
 
 
 if __name__ == "__main__":
@@ -757,6 +817,19 @@ HTML = """<!DOCTYPE html>
           <input type="range" id="cfg-threshold" min="0" max="255" step="1"
                  oninput="document.getElementById('thr-val').textContent=this.value">
           <div class="range-val">Threshold: <span id="thr-val">160</span></div>
+        </div>
+        <div class="field">
+          <label>Output format</label>
+          <select id="cfg-format" style="width:100%;background:#0a0f1e;border:1px solid #1f2d45;border-radius:6px;padding:.45rem .75rem;color:#e2e8f0;font-size:.83rem;outline:none;">
+            <option value="png">PNG (lossless, larger)</option>
+            <option value="jpeg">JPEG (lossy, smaller)</option>
+          </select>
+        </div>
+        <div class="field" id="qualityField">
+          <label>JPEG quality (1&ndash;95)</label>
+          <input type="range" id="cfg-jpeg_quality" min="1" max="95" step="1"
+                 oninput="document.getElementById('q-val').textContent=this.value">
+          <div class="range-val">Quality: <span id="q-val">85</span></div>
         </div>
       </div>
 
@@ -1073,6 +1146,15 @@ HTML = """<!DOCTYPE html>
     const thrEl = document.getElementById('cfg-threshold');
     thrEl.value = cfg.threshold || 160;
     document.getElementById('thr-val').textContent = thrEl.value;
+    const fmt = cfg.format || 'png';
+    document.getElementById('cfg-format').value = fmt;
+    const qEl = document.getElementById('cfg-jpeg_quality');
+    qEl.value = cfg.jpeg_quality || 85;
+    document.getElementById('q-val').textContent = qEl.value;
+    document.getElementById('qualityField').style.display = fmt === 'jpeg' ? '' : 'none';
+    document.getElementById('cfg-format').onchange = function() {
+      document.getElementById('qualityField').style.display = this.value === 'jpeg' ? '' : 'none';
+    };
     document.getElementById('cfg-enable_upload').checked = cfg.enable_upload !== false;
     document.getElementById('cfg-sync_interval_minutes').value = cfg.sync_interval_minutes || 30;
     document.getElementById('cfg-drive_folder_id').value = cfg.drive_folder_id || '';
@@ -1084,6 +1166,8 @@ HTML = """<!DOCTYPE html>
       output_dir:            document.getElementById('cfg-output_dir').value.trim(),
       dpi:                   parseInt(document.getElementById('cfg-dpi').value),
       threshold:             parseInt(document.getElementById('cfg-threshold').value),
+      format:                document.getElementById('cfg-format').value,
+      jpeg_quality:          parseInt(document.getElementById('cfg-jpeg_quality').value),
       enable_upload:         document.getElementById('cfg-enable_upload').checked,
       sync_interval_minutes: parseInt(document.getElementById('cfg-sync_interval_minutes').value),
       drive_folder_id:       document.getElementById('cfg-drive_folder_id').value.trim(),
