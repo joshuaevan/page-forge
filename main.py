@@ -525,6 +525,14 @@ def _cli():
     args = parser.parse_args()
 
     if not args.pdfs:
+        print(r"""
+   ____                         ______
+  ╱ __ ╲____ _____ ____        ╱ ____╱___  _________ ____
+ ╱ ╱_╱ ╱ __ `╱ __ `╱ _ ╲______╱ ╱_  ╱ __ ╲╱ ___╱ __ `╱ _ ╲
+╱ ____╱ ╱_╱ ╱ ╱_╱ ╱  __╱_____╱ __╱ ╱ ╱_╱ ╱ ╱  ╱ ╱_╱ ╱  __╱
+╱_╱    ╲__,_╱╲__, ╱╲___╱     ╱_╱    ╲____╱_╱   ╲__, ╱╲___╱
+            ╱____╱                            ╱____╱
+""")
         parser.print_help()
         print("\n  Start the web server:  uvicorn main:app --host 0.0.0.0 --port 8000")
         sys.exit(0)
