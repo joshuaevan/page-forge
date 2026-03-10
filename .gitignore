@@ -1,0 +1,38 @@
+# Data directory — user content, credentials, state
+data/credentials.json
+data/state.json
+data/inbox/
+data/output/
+data/import.lock
+data/config.json
+
+# Environment files
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Docker
+.docker/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# Logs
+*.log

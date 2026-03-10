@@ -1,0 +1,20 @@
+services:
+  pageforge:
+    build: .
+    container_name: pageforge
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      # Optional — override defaults
+      # PAGEFORGE_INBOX: /data/inbox
+      # PAGEFORGE_OUTPUT: /data/output
+      # PAGEFORGE_DPI: 300
+      # PAGEFORGE_THRESHOLD: 160
+      # PAGEFORGE_ENABLE_UPLOAD: "true"
+      # SYNC_INTERVAL_MINUTES: 30
+
+      # Google Drive (optional — leave blank to disable)
+      # DRIVE_FOLDER_ID: your_google_drive_folder_id_here
